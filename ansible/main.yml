@@ -1,0 +1,157 @@
+- name: Update Ubuntu, install Docker, and test the server
+  hosts: webservers
+  become: true
+
+  vars:
+    allow_reboot: false # set true (-e allow_reboot=true) to reboot when updates require it
+    test_container: web-test
+    test_port: 80
+
+  tasks:
+    # ---------- 1. Update the system ----------
+
+    - name: Update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        cache_valid_time: 3600
+        lock_timeout: 120 # wait if cloud-init is still using apt on a new server
+
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot if required and allowed
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: reboot_required.stat.exists and allow_reboot
+
+    - name: Warn if a reboot is pending but not allowed
+      ansible.builtin.debug:
+        msg: "A reboot is pending. Rerun with -e allow_reboot=true when convenient."
+      when: reboot_required.stat.exists and not allow_reboot
+
+    # ---------- 2. Install Docker (official repository) ----------
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+        lock_timeout: 120
+
+    - name: Create keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Docker's GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add Docker's apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Install Docker Engine and the Python Docker library
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+          - python3-docker # lets Ansible's docker modules talk to Docker
+        state: present
+        lock_timeout: 120
+
+    # ---------- 3. Start Docker ----------
+
+    - name: Start Docker and enable it on boot
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Let the ubuntu user run docker without sudo (takes effect on next login)
+      ansible.builtin.user:
+        name: "{{ ansible_user | default('ubuntu') }}"
+        groups: docker
+        append: true
+
+    # ---------- 4. Test that the server works ----------
+
+    - name: Confirm Docker is installed and report its version
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Show Docker version
+      ansible.builtin.debug:
+        msg: "{{ docker_version.stdout }}"
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Assert that the Docker service is running
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services['docker.service'].state == 'running'
+        fail_msg: "Docker is not running"
+        success_msg: "Docker service is running"
+
+    - name: Run the hello-world container (proves Docker can pull and run images)
+      community.docker.docker_container:
+        name: hello-test
+        image: hello-world
+        detach: false
+        cleanup: true
+        pull: true
+      register: hello
+
+    - name: Run an nginx test container
+      community.docker.docker_container:
+        name: "{{ test_container }}"
+        image: nginx:1.27
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "{{ test_port }}:80"
+
+    - name: Check that the web server answers on the instance
+      ansible.builtin.uri:
+        url: "http://localhost:{{ test_port }}"
+        status_code: 200
+      register: web_check
+      retries: 10
+      delay: 3
+      until: web_check.status == 200
+
+    - name: Check the server from outside (needs port 80 open in the security group)
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ test_port }}"
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+      register: external_check
+      ignore_errors: true
+
+    - name: Test summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+          - "{{ docker_version.stdout }}"
+          - "Local web check: HTTP {{ web_check.status }}"
+          - "External web check: {{ 'OK (HTTP ' ~ external_check.status ~ ')' if external_check is succeeded else 'FAILED - open port ' ~ test_port ~ ' in the security group' }}"
